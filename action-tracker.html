@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Action Tracker — Alex G Todd</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Aptos, 'Proxima Nova', 'Segoe UI', system-ui, sans-serif; background: #eff1eb; color: #1a2e24; min-height: 100vh; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner { display: inline-block; width: 13px; height: 13px; border: 2px solid #a3bd80; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  textarea, input, select { font-family: inherit; }
+  ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #eff1eb; } ::-webkit-scrollbar-thumb { background: #d4ddd0; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback } = React;
+
+const C = {
+  darkGreen:"#335548", midGreen:"#a3bd80", softGreen:"#eff1eb",
+  white:"#ffffff", text:"#1a2e24", textMuted:"#6b7e72",
+  border:"#d4ddd0", danger:"#c0392b", warn:"#d68910", success:"#27ae60",
+};
+const PC = {
+  High:   { color: C.danger,  bg: "#fdf2f2" },
+  Medium: { color: C.warn,    bg: "#fef9f0" },
+  Low:    { color: C.success, bg: "#f0f9f4" },
+};
+
+const STORAGE_KEY   = "agt_action_tracker_v3";
+const PROCESSED_KEY = "agt_processed_emails_v1";
+const NAME_TRIGGERS = ["AT","AGT","Alex Todd","Alexander Todd","Alex G Todd","Alex G. Todd","Alex"];
+const M365_MCP      = "https://microsoft365.mcp.claude.com/mcp";
+const FOLDER_NAME   = "Task Tracker";
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+const genId   = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+const today   = () => new Date().toISOString().slice(0,10);
+const fmtDate = s => {
+  if (!s) return "";
+  try { const d = new Date(s); return isNaN(d) ? s : d.toLocaleDateString("en-NZ", { day:"2-digit", month:"short", year:"numeric" }); }
+  catch { return s; }
+};
+const isOverdue = s => {
+  if (!s) return false;
+  try { const d = new Date(s); return !isNaN(d) && d < new Date() && d.toDateString() !== new Date().toDateString(); }
+  catch { return false; }
+};
+const fileToBase64 = file => new Promise((res, rej) => {
+  const r = new FileReader();
+  r.onload = e => res(e.target.result.split(",")[1]);
+  r.onerror = () => rej(new Error("File read failed"));
+  r.readAsDataURL(file);
+});
+const getMime = file => {
+  const ext = file.name.split(".").pop().toLowerCase();
+  if (ext === "pdf") return "application/pdf";
+  if (["doc","docx"].includes(ext)) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  return file.type || "text/plain";
+};
+const isSupported = file => ["pdf","doc","docx","txt","md"].includes(file.name.split(".").pop().toLowerCase());
+
+// ── localStorage persistence ──────────────────────────────────────────────
+const loadTasks     = () => { try { const v = localStorage.getItem(STORAGE_KEY);     return v ? JSON.parse(v) : []; } catch { return []; } };
+const saveTasks     = t  => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(t)); } catch {} };
+const loadProcessed = () => { try { const v = localStorage.getItem(PROCESSED_KEY);   return v ? new Set(JSON.parse(v)) : new Set(); } catch { return new Set(); } };
+const saveProcessed = s  => { try { localStorage.setItem(PROCESSED_KEY, JSON.stringify([...s])); } catch {} };
+
+// ── Claude API ────────────────────────────────────────────────────────────
+const SYSTEM = `You are an action item extractor for Alex G Todd, a civil engineering and surveying director in New Zealand.
+
+Extract ONLY action items assigned to this person. They appear as: ${NAME_TRIGGERS.map(t=>`"${t}"`).join(", ")}
+
+Rules:
+- Do NOT extract actions for other people
+- If "Alex" is ambiguous, skip it
+- Infer project from context (subdivision names, job numbers, client names)
+- Priority: urgent/ASAP = High; near deadline = Medium; general = Low
+- Due dates: convert relative to ISO using today's date. Unknown = ""
+- Return ONLY a valid JSON array, no preamble, no markdown fences.
+
+Each object: { "task": string, "project": string, "dueDate": "YYYY-MM-DD or empty", "priority": "High|Medium|Low", "source": string, "notes": string }`;
+
+async function claudeExtractText(text, sourceName) {
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:1000, system:SYSTEM,
+      messages: [{ role:"user", content:`Today: ${today()}\nSource: "${sourceName}"\n\n${text}` }] }),
+  });
+  if (!r.ok) throw new Error(`API error ${r.status} — check you are logged in to claude.ai`);
+  const d = await r.json();
+  return JSON.parse((d.content?.find(b=>b.type==="text")?.text||"[]").replace(/```json|```/g,"").trim());
+}
+
+async function claudeExtractFile(base64, mime, fileName) {
+  const isPdf = mime === "application/pdf";
+  const isDoc = mime.includes("wordprocessingml") || mime.includes("msword");
+  if (!isPdf && !isDoc) return claudeExtractText(atob(base64), fileName);
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:1000, system:SYSTEM,
+      messages: [{ role:"user", content:[
+        { type:"document", source:{ type:"base64", media_type:mime, data:base64 } },
+        { type:"text", text:`Today: ${today()}\nSource: "${fileName}"\n\nExtract action items as instructed.` },
+      ]}],
+      betas: ["files-api-2025-04-14"],
+    }),
+  });
+  if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e?.error?.message || `API ${r.status}`); }
+  const d = await r.json();
+  return JSON.parse((d.content?.find(b=>b.type==="text")?.text||"[]").replace(/```json|```/g,"").trim());
+}
+
+async function fetchTaskTrackerEmails() {
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model:"claude-sonnet-4-6", max_tokens:1000,
+      system: "You are a tool executor. Execute tool calls and return results as a clean JSON array. No preamble.",
+      messages: [{ role:"user", content:`Use the Microsoft 365 outlook_email_search tool to search the "${FOLDER_NAME}" folder. For each email found, use read_resource to get the full body. Return a JSON array where each item has: id, subject, sender, receivedDate, body. Return ONLY the JSON array.` }],
+      mcp_servers: [{ type:"url", url:M365_MCP, name:"m365" }],
+    }),
+  });
+  if (!r.ok) throw new Error(`M365 API ${r.status}`);
+  const d = await r.json();
+  const texts = d.content?.filter(b=>b.type==="text").map(b=>b.text)||[];
+  for (const t of texts) { try { const c=t.replace(/```json|```/g,"").trim(); if(c.startsWith("[")) return JSON.parse(c); } catch {} }
+  const trs = d.content?.filter(b=>b.type==="mcp_tool_result")||[];
+  for (const tr of trs) { try { const c=(tr.content?.[0]?.text||"").replace(/```json|```/g,"").trim(); if(c.startsWith("[")) return JSON.parse(c); } catch {} }
+  return [];
+}
+
+async function extractActionsFromEmails(emails, processedIds) {
+  const newEmails = emails.filter(e => !processedIds.has(e.id));
+  if (!newEmails.length) return { actions:[], newIds:[] };
+  const allActions = [];
+  for (const email of newEmails) {
+    const text = `From: ${email.sender}\nSubject: ${email.subject}\nDate: ${email.receivedDate}\n\n${email.body||""}`;
+    try { const actions = await claudeExtractText(text, email.subject||"Email"); actions.forEach(a=>{ a._emailId=email.id; a._emailSubject=email.subject; }); allActions.push(...actions); }
+    catch(e) { console.warn("Extract failed:", email.subject, e); }
+  }
+  return { actions:allActions, newIds:newEmails.map(e=>e.id) };
+}
+
+// ── Shared styles ─────────────────────────────────────────────────────────
+const S = {
+  iconBtn: { background:"none", border:"none", cursor:"pointer", fontSize:13, color:C.textMuted, padding:"2px 5px", lineHeight:1 },
+  primary: { background:C.darkGreen, color:C.white, border:"none", padding:"7px 16px", borderRadius:6, fontSize:13, fontWeight:600, cursor:"pointer", fontFamily:"inherit" },
+  ghost:   { background:"none", color:C.darkGreen, border:`1px solid ${C.border}`, padding:"7px 14px", borderRadius:6, fontSize:13, cursor:"pointer", fontFamily:"inherit" },
+  input:   { width:"100%", fontFamily:"inherit", fontSize:13, border:`1px solid ${C.border}`, borderRadius:5, padding:"6px 10px", color:C.text, background:C.white, outline:"none" },
+  label:   { display:"block", fontSize:11, color:C.textMuted, marginBottom:3, fontWeight:600 },
+};
+
+// ── Components ────────────────────────────────────────────────────────────
+function PBadge({ p }) {
+  const cfg = PC[p] || PC.Medium;
+  return <span style={{ fontSize:11, fontWeight:600, color:cfg.color, background:cfg.bg, padding:"2px 7px", borderRadius:4, border:`1px solid ${cfg.color}33` }}>{p}</span>;
+}
+
+function TaskCard({ task, onToggle, onUpdate, onDelete, onDragStart, onDragOver, onDrop }) {
+  const [exp, setExp]   = useState(false);
+  const [edit, setEdit] = useState(false);
+  const [ed, setEd]     = useState({});
+  const ov = !task.completed && isOverdue(task.dueDate);
+  return (
+    <div draggable onDragStart={()=>onDragStart(task.id)} onDragOver={e=>{e.preventDefault();onDragOver(task.id);}} onDrop={()=>onDrop(task.id)}
+      style={{ background:task.completed?"#f8faf7":C.white, border:`1px solid ${ov?"#e74c3c55":C.border}`,
+        borderLeft:`3px solid ${task.completed?C.border:(PC[task.priority]?.color||C.midGreen)}`,
+        borderRadius:6, marginBottom:8, opacity:task.completed?0.72:1, cursor:"grab", userSelect:"none" }}>
+      <div style={{ display:"flex", alignItems:"flex-start", gap:10, padding:"10px 12px" }}>
+        <div onClick={()=>onToggle(task.id)} style={{ width:18, height:18, borderRadius:4, flexShrink:0, marginTop:2,
+          border:`2px solid ${task.completed?C.midGreen:C.border}`, background:task.completed?C.midGreen:C.white,
+          display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer" }}>
+          {task.completed && <svg width="10" height="8" viewBox="0 0 10 8"><path d="M1 4L3.5 6.5L9 1" stroke="white" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+        </div>
+        <div style={{ flex:1, minWidth:0 }}>
+          {edit
+            ? <textarea value={ed.task} onChange={e=>setEd(d=>({...d,task:e.target.value}))} style={{ ...S.input, minHeight:50, resize:"vertical" }} />
+            : <div style={{ fontSize:13, color:task.completed?C.textMuted:C.text, textDecoration:task.completed?"line-through":"none", lineHeight:1.45, wordBreak:"break-word" }}>{task.task}</div>
+          }
+          <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginTop:5, alignItems:"center" }}>
+            <PBadge p={task.priority} />
+            {task.dueDate && <span style={{ fontSize:11, color:ov?C.danger:C.textMuted, fontWeight:ov?600:400 }}>{ov?"⚠ ":""}{fmtDate(task.dueDate)}</span>}
+            {task.source  && <span style={{ fontSize:11, color:C.textMuted }}>· {task.source}</span>}
+            {task.project && task.project!=="General" && <span style={{ fontSize:11, color:C.darkGreen, background:C.softGreen, padding:"1px 6px", borderRadius:3 }}>{task.project}</span>}
+            {task.fromEmail && <span style={{ fontSize:10, color:"#1a6b3c", background:"#e0f2ea", padding:"1px 5px", borderRadius:3 }}>email</span>}
+          </div>
+        </div>
+        <div style={{ display:"flex", gap:3, flexShrink:0 }}>
+          <button onClick={()=>setExp(e=>!e)} style={S.iconBtn} title="Expand">{exp?"▲":"▼"}</button>
+          <button onClick={()=>{ setEd({...task}); setEdit(true); setExp(true); }} style={S.iconBtn} title="Edit">✏</button>
+          <button onClick={()=>onDelete(task.id)} style={{ ...S.iconBtn, color:C.danger }} title="Delete">✕</button>
+        </div>
+      </div>
+      {exp && (
+        <div style={{ borderTop:`1px solid ${C.border}`, padding:"10px 12px", background:C.softGreen }}>
+          {edit ? (
+            <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
+                {[["Project","project","text"],["Due Date","dueDate","date"],["Source","source","text"]].map(([l,k,t])=>(
+                  <div key={k}><label style={S.label}>{l}</label><input type={t} value={ed[k]||""} onChange={e=>setEd(d=>({...d,[k]:e.target.value}))} style={S.input}/></div>
+                ))}
+                <div><label style={S.label}>Priority</label>
+                  <select value={ed.priority||"Medium"} onChange={e=>setEd(d=>({...d,priority:e.target.value}))} style={S.input}>
+                    <option>High</option><option>Medium</option><option>Low</option>
+                  </select>
+                </div>
+              </div>
+              <div><label style={S.label}>Notes</label><textarea value={ed.notes||""} onChange={e=>setEd(d=>({...d,notes:e.target.value}))} style={{ ...S.input, minHeight:50, resize:"vertical" }}/></div>
+              <div style={{ display:"flex", gap:8 }}>
+                <button onClick={()=>{ onUpdate(task.id,ed); setEdit(false); }} style={S.primary}>Save</button>
+                <button onClick={()=>setEdit(false)} style={S.ghost}>Cancel</button>
+              </div>
+            </div>
+          ) : (
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:4, fontSize:12 }}>
+              <div><span style={{ color:C.textMuted }}>Project: </span>{task.project||"—"}</div>
+              <div><span style={{ color:C.textMuted }}>Due: </span>{task.dueDate?fmtDate(task.dueDate):"—"}</div>
+              <div><span style={{ color:C.textMuted }}>Source: </span>{task.source||"—"}</div>
+              <div><span style={{ color:C.textMuted }}>Added: </span>{fmtDate(task.addedDate)}</div>
+              {task.notes && <div style={{ gridColumn:"1/-1", marginTop:4 }}><span style={{ color:C.textMuted }}>Notes: </span>{task.notes}</div>}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ReviewPanel({ candidates, onConfirm, onDismiss }) {
+  const [sel, setSel] = useState(() => candidates.map((_,i)=>i));
+  const toggle = i => setSel(s => s.includes(i) ? s.filter(x=>x!==i) : [...s,i]);
+  return (
+    <div style={{ position:"fixed", top:0, left:0, right:0, bottom:0, background:"rgba(0,0,0,0.45)", zIndex:1000, display:"flex", alignItems:"center", justifyContent:"center", padding:16 }}>
+      <div style={{ background:C.white, borderRadius:10, maxWidth:640, width:"100%", maxHeight:"85vh", display:"flex", flexDirection:"column", overflow:"hidden", boxShadow:"0 8px 40px rgba(0,0,0,0.2)" }}>
+        <div style={{ padding:"14px 20px", background:C.darkGreen, borderRadius:"10px 10px 0 0" }}>
+          <div style={{ fontSize:15, fontWeight:700, color:C.white }}>Review extracted actions</div>
+          <div style={{ fontSize:12, color:C.midGreen, marginTop:2 }}>{candidates.length} action{candidates.length!==1?"s":""} found — tick to add</div>
+        </div>
+        <div style={{ flex:1, overflowY:"auto", padding:16 }}>
+          {candidates.map((c,i) => (
+            <div key={i} onClick={()=>toggle(i)} style={{ display:"flex", gap:10, padding:"10px 12px", borderRadius:6,
+              border:`1px solid ${sel.includes(i)?C.midGreen:C.border}`, background:sel.includes(i)?"#f0f6ea":C.white, marginBottom:8, cursor:"pointer" }}>
+              <div style={{ width:17, height:17, borderRadius:4, flexShrink:0, marginTop:1,
+                border:`2px solid ${sel.includes(i)?C.midGreen:C.border}`, background:sel.includes(i)?C.midGreen:C.white,
+                display:"flex", alignItems:"center", justifyContent:"center" }}>
+                {sel.includes(i) && <svg width="9" height="7" viewBox="0 0 10 8"><path d="M1 4L3.5 6.5L9 1" stroke="white" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+              </div>
+              <div style={{ flex:1, minWidth:0 }}>
+                <div style={{ fontSize:13, color:C.text, lineHeight:1.4 }}>{c.task}</div>
+                <div style={{ display:"flex", flexWrap:"wrap", gap:5, marginTop:4, alignItems:"center" }}>
+                  <PBadge p={c.priority||"Medium"} />
+                  {c.dueDate && <span style={{ fontSize:11, color:C.textMuted }}>{fmtDate(c.dueDate)}</span>}
+                  {c.project && <span style={{ fontSize:11, color:C.darkGreen, background:C.softGreen, padding:"1px 5px", borderRadius:3 }}>{c.project}</span>}
+                  {c.source  && <span style={{ fontSize:11, color:C.textMuted }}>· {c.source}</span>}
+                </div>
+                {c.notes && <div style={{ fontSize:11, color:C.textMuted, marginTop:3 }}>{c.notes}</div>}
+              </div>
+            </div>
+          ))}
+        </div>
+        <div style={{ padding:"12px 20px", borderTop:`1px solid ${C.border}`, display:"flex", gap:8, justifyContent:"flex-end", background:"#fafafa", borderRadius:"0 0 10px 10px" }}>
+          <span style={{ fontSize:12, color:C.textMuted, marginRight:"auto", alignSelf:"center" }}>{sel.length} of {candidates.length} selected</span>
+          <button onClick={onDismiss} style={S.ghost}>Discard all</button>
+          <button onClick={()=>onConfirm(sel.map(i=>candidates[i]))} disabled={!sel.length} style={{ ...S.primary, opacity:sel.length?1:0.5 }}>Add {sel.length} task{sel.length!==1?"s":""}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────
+function App() {
+  const [tasks,    setTasks]    = useState(() => loadTasks());
+  const [view,     setView]     = useState("board");
+  const [filter,   setFilter]   = useState("active");
+  const [groupBy,  setGroupBy]  = useState("project");
+  const [showAdd,  setShowAdd]  = useState(false);
+  const [manual,   setManual]   = useState({ task:"", project:"", dueDate:"", priority:"Medium", source:"", notes:"" });
+  const [dragId,   setDragId]   = useState(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [candidates, setCands]  = useState(null);
+  const [extracting, setExtr]   = useState(false);
+  const [status,   setStatus]   = useState("");
+  const [checking, setChecking] = useState(false);
+  const [emailStatus, setEStatus] = useState("");
+  const [pasteText, setPaste]   = useState("");
+  const [error,    setError]    = useState("");
+  const [success,  setSuccess]  = useState("");
+  const fileRef = useRef(null);
+
+  useEffect(() => { saveTasks(tasks); }, [tasks]);
+
+  const flash = (msg, err=false) => {
+    if (err) { setError(msg); setTimeout(()=>setError(""), 5000); }
+    else     { setSuccess(msg); setTimeout(()=>setSuccess(""), 3500); }
+  };
+
+  async function processExtracted(extracted, source, fromEmail=false) {
+    if (!extracted.length) { flash("No actions assigned to you were found.", true); return; }
+    const newT = extracted.map(a => ({ id:genId(), task:a.task||"", project:a.project||"General", dueDate:a.dueDate||"", priority:a.priority||"Medium", source:a.source||source, notes:a.notes||"", completed:false, addedDate:today(), fromEmail }));
+    setTasks(p => [...newT, ...p]); setPaste(""); setView("board");
+    flash(`${newT.length} action${newT.length!==1?"s":""} extracted and added.`);
+  }
+
+  async function handleFile(file) {
+    if (!isSupported(file)) { flash("Unsupported file. Use PDF, .docx, .txt or .md", true); return; }
+    setExtr(true); setError("");
+    setStatus(`Reading ${file.name.split(".").pop().toUpperCase()}…`);
+    try {
+      const b64  = await fileToBase64(file);
+      const mime = getMime(file);
+      setStatus("Extracting your actions…");
+      const extracted = await claudeExtractFile(b64, mime, file.name);
+      await processExtracted(extracted, file.name);
+    } catch(e) { flash(e.message||"Extraction failed.", true); }
+    setExtr(false); setStatus("");
+  }
+
+  async function handlePaste() {
+    if (!pasteText.trim()) return;
+    setExtr(true); setError(""); setStatus("Extracting your actions…");
+    try { const ext = await claudeExtractText(pasteText, "Pasted text"); await processExtracted(ext, "Pasted text"); }
+    catch(e) { flash(e.message||"Extraction failed.", true); }
+    setExtr(false); setStatus("");
+  }
+
+  async function checkEmails() {
+    setChecking(true); setError(""); setStatus("Connecting to Outlook…");
+    try {
+      setStatus(`Searching "${FOLDER_NAME}" folder…`);
+      const emails = await fetchTaskTrackerEmails();
+      if (!emails.length) {
+        setEStatus(`No emails in "${FOLDER_NAME}" folder.`);
+        flash(`No emails found in "${FOLDER_NAME}". Create the folder and copy emails into it first.`);
+        setChecking(false); setStatus(""); return;
+      }
+      const processed  = loadProcessed();
+      const newEmails  = emails.filter(e => !processed.has(e.id));
+      if (!newEmails.length) {
+        setEStatus(`Last checked: ${new Date().toLocaleTimeString("en-NZ")} — no new emails.`);
+        flash("No new emails to process — all already checked.");
+        setChecking(false); setStatus(""); return;
+      }
+      setStatus(`Extracting actions from ${newEmails.length} email${newEmails.length!==1?"s":""}…`);
+      const { actions, newIds } = await extractActionsFromEmails(emails, processed);
+      newIds.forEach(id => processed.add(id)); saveProcessed(processed);
+      setEStatus(`Last checked: ${new Date().toLocaleTimeString("en-NZ")} · ${newEmails.length} email${newEmails.length!==1?"s":""} scanned`);
+      if (!actions.length) { flash("Emails scanned — no actions assigned to you found."); setChecking(false); setStatus(""); return; }
+      setCands(actions);
+    } catch(e) { flash(e.message||"Could not connect to Outlook. Ensure you are logged in to claude.ai in this browser.", true); }
+    setChecking(false); setStatus("");
+  }
+
+  function confirmCandidates(selected) {
+    const newT = selected.map(a => ({ id:genId(), task:a.task||"", project:a.project||"General", dueDate:a.dueDate||"", priority:a.priority||"Medium", source:a._emailSubject||a.source||"Email", notes:a.notes||"", completed:false, addedDate:today(), fromEmail:true }));
+    setTasks(p => [...newT, ...p]); setCands(null); setView("board");
+    flash(`${newT.length} action${newT.length!==1?"s":""} added from emails.`);
+  }
+
+  const toggleTask = id => setTasks(p => p.map(t => t.id===id ? {...t, completed:!t.completed} : t));
+  const updateTask = (id,d) => setTasks(p => p.map(t => t.id===id ? {...t,...d} : t));
+  const deleteTask = id => setTasks(p => p.filter(t => t.id!==id));
+
+  function addManual() {
+    if (!manual.task.trim()) return;
+    setTasks(p => [{ ...manual, id:genId(), completed:false, addedDate:today() }, ...p]);
+    setManual({ task:"", project:"", dueDate:"", priority:"Medium", source:"", notes:"" });
+    setShowAdd(false); flash("Task added.");
+  }
+
+  function handleDragOver(targetId) {
+    if (!dragId || dragId===targetId) return;
+    setTasks(prev => {
+      const a=[...prev], from=a.findIndex(t=>t.id===dragId), to=a.findIndex(t=>t.id===targetId);
+      if (from<0||to<0) return a;
+      const [item]=a.splice(from,1); a.splice(to,0,item); return a;
+    });
+  }
+
+  function exportCSV() {
+    const hdr  = "Task,Project,Priority,Due Date,Source,Status,Notes";
+    const rows = tasks.map(t => [t.task,t.project,t.priority,t.dueDate,t.source,t.completed?"Done":"Open",t.notes].map(v=>`"${(v||"").replace(/"/g,'""')}"`).join(","));
+    const blob = new Blob([[hdr,...rows].join("\n")], { type:"text/csv" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a"); a.href=url; a.download="actions_alex_todd.csv"; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const filtered = tasks.filter(t => filter==="active" ? !t.completed : filter==="completed" ? t.completed : true);
+
+  function groupTasks(list) {
+    if (groupBy==="none") return { "All Tasks": list };
+    const key   = groupBy==="priority" ? "priority" : "project";
+    const order = groupBy==="priority" ? ["High","Medium","Low"] : null;
+    const g = {};
+    list.forEach(t => { const k=t[key]||"Other"; if(!g[k])g[k]=[]; g[k].push(t); });
+    if (order) { const o={}; order.forEach(k=>{if(g[k])o[k]=g[k];}); Object.keys(g).forEach(k=>{if(!o[k])o[k]=g[k];}); return o; }
+    return Object.fromEntries(Object.entries(g).sort(([a],[b])=>a.localeCompare(b)));
+  }
+
+  const grouped      = groupTasks(filtered);
+  const activeCount  = tasks.filter(t=>!t.completed).length;
+  const overdueCount = tasks.filter(t=>!t.completed&&isOverdue(t.dueDate)).length;
+
+  return (
+    <div style={{ minHeight:"100vh", background:C.softGreen }}>
+      {candidates && <ReviewPanel candidates={candidates} onConfirm={confirmCandidates} onDismiss={()=>setCands(null)} />}
+
+      {/* Header */}
+      <div style={{ background:C.darkGreen, color:C.white, padding:"14px 28px", display:"flex", alignItems:"center", justifyContent:"space-between", position:"sticky", top:0, zIndex:10 }}>
+        <div>
+          <div style={{ fontSize:18, fontWeight:700, letterSpacing:"-0.02em" }}>Action Tracker</div>
+          <div style={{ fontSize:12, color:C.midGreen, marginTop:2 }}>Alex G Todd · AT / AGT</div>
+        </div>
+        <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+          {overdueCount>0 && <span style={{ background:C.danger, color:C.white, fontSize:11, fontWeight:700, padding:"2px 8px", borderRadius:10 }}>{overdueCount} overdue</span>}
+          <span style={{ background:"#ffffff22", fontSize:12, padding:"3px 10px", borderRadius:10, color:C.midGreen }}>{activeCount} open</span>
+          <button onClick={exportCSV} style={{ background:"none", border:"1px solid #ffffff33", color:C.midGreen, padding:"5px 12px", borderRadius:5, fontSize:12, cursor:"pointer" }}>Export CSV</button>
+        </div>
+      </div>
+
+      {/* Nav */}
+      <div style={{ background:C.white, borderBottom:`1px solid ${C.border}`, padding:"0 28px", display:"flex", position:"sticky", top:54, zIndex:9 }}>
+        {[["board","📋  Tasks"],["import","📥  Import"],["email","📧  Emails"]].map(([v,lbl]) => (
+          <button key={v} onClick={()=>setView(v)} style={{ background:"none", border:"none", padding:"11px 16px", fontSize:13, fontFamily:"inherit",
+            color:view===v?C.darkGreen:C.textMuted, fontWeight:view===v?700:400,
+            borderBottom:view===v?`2px solid ${C.darkGreen}`:"2px solid transparent", cursor:"pointer" }}>{lbl}</button>
+        ))}
+      </div>
+
+      {/* Notifications */}
+      {(error||success) && (
+        <div style={{ margin:"14px 28px 0", padding:"10px 14px", borderRadius:6,
+          background:error?"#fdf2f2":"#f0f9f4",
+          border:`1px solid ${error?C.danger+"44":C.success+"44"}`,
+          color:error?C.danger:C.success, fontSize:13 }}>
+          {error||success}
+          {error && <button onClick={()=>setError("")} style={{ float:"right", background:"none", border:"none", cursor:"pointer", color:C.danger, fontSize:16 }}>✕</button>}
+        </div>
+      )}
+
+      <div style={{ padding:"18px 28px", maxWidth:900, margin:"0 auto" }}>
+
+        {/* ── EMAIL TAB ── */}
+        {view==="email" && (
+          <div>
+            <div style={{ background:C.white, border:`1px solid ${C.border}`, borderRadius:8, padding:"16px 20px", marginBottom:16 }}>
+              <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:16 }}>
+                <div style={{ flex:1 }}>
+                  <div style={{ fontSize:14, fontWeight:700, color:C.darkGreen, marginBottom:5 }}>Outlook · Task Tracker folder</div>
+                  <div style={{ fontSize:12, color:C.textMuted, lineHeight:1.8 }}>
+                    Claude scans your <strong>Task Tracker</strong> folder in Outlook, extracts only your actions from each email, and shows them for review before adding to your board. Already-processed emails are remembered — no duplicates.
+                  </div>
+                  <div style={{ fontSize:12, color:C.textMuted, marginTop:8, padding:"8px 10px", background:C.softGreen, borderRadius:5 }}>
+                    ⓘ The email check requires you to be <strong>logged in to claude.ai</strong> in this same browser session.
+                  </div>
+                  {emailStatus && <div style={{ fontSize:11, color:C.textMuted, marginTop:8 }}>{emailStatus}</div>}
+                </div>
+                <button onClick={checkEmails} disabled={checking} style={{ ...S.primary, flexShrink:0, opacity:checking?0.6:1, cursor:checking?"not-allowed":"pointer", minWidth:130, display:"flex", alignItems:"center", gap:7, justifyContent:"center" }}>
+                  {checking ? <><span className="spinner"></span>{status||"Checking…"}</> : "Check emails"}
+                </button>
+              </div>
+            </div>
+
+            <div style={{ background:C.white, border:`1px solid ${C.border}`, borderRadius:8, padding:"14px 18px" }}>
+              <div style={{ fontSize:13, fontWeight:700, color:C.darkGreen, marginBottom:12 }}>One-time Outlook setup</div>
+              {[
+                ["1","Create the folder",      "Right-click Inbox → New Folder → name it exactly: Task Tracker"],
+                ["2","Create a Quick Step",    "Home tab → Quick Steps → small arrow → New Quick Step → Copy to Folder → select Task Tracker"],
+                ["3","Name and shortcut",      "Name it Send to Task Tracker — optionally assign Ctrl+Shift+T"],
+                ["4","Use it daily",           "Select any email with actions → click Send to Task Tracker → return here → Check emails"],
+              ].map(([n,title,detail]) => (
+                <div key={n} style={{ display:"flex", gap:12, marginBottom:11, alignItems:"flex-start" }}>
+                  <div style={{ width:22, height:22, borderRadius:"50%", background:C.darkGreen, color:C.white, fontSize:11, fontWeight:700, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>{n}</div>
+                  <div>
+                    <div style={{ fontSize:13, fontWeight:600, color:C.text }}>{title}</div>
+                    <div style={{ fontSize:12, color:C.textMuted, marginTop:2 }}>{detail}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ── IMPORT TAB ── */}
+        {view==="import" && (
+          <div>
+            <div
+              onDragOver={e=>{ e.preventDefault(); setDragOver(true); }}
+              onDragLeave={()=>setDragOver(false)}
+              onDrop={e=>{ e.preventDefault(); setDragOver(false); const f=e.dataTransfer.files[0]; if(f) handleFile(f); }}
+              onClick={()=>fileRef.current?.click()}
+              style={{ border:`2px dashed ${dragOver?C.darkGreen:C.midGreen}`, borderRadius:8, padding:"40px 24px", textAlign:"center",
+                background:dragOver?"#e8f0e4":C.white, marginBottom:18, cursor:"pointer", transition:"all 0.15s" }}>
+              <div style={{ fontSize:40, marginBottom:8 }}>📄</div>
+              <div style={{ fontSize:15, fontWeight:600, color:C.darkGreen }}>{extracting ? status : "Drop minutes here or click to browse"}</div>
+              <div style={{ fontSize:12, color:C.textMuted, marginTop:6, lineHeight:1.7 }}>
+                <strong>PDF</strong> · <strong>Word (.docx)</strong> · .txt · .md
+              </div>
+              {extracting && <div style={{ marginTop:14, display:"flex", alignItems:"center", justifyContent:"center", gap:8, color:C.darkGreen }}>
+                <span className="spinner"></span>
+                <span style={{ fontSize:13 }}>{status}</span>
+              </div>}
+            </div>
+            <input ref={fileRef} type="file" accept=".pdf,.doc,.docx,.txt,.md" style={{ display:"none" }}
+              onChange={e=>{ if(e.target.files[0]) handleFile(e.target.files[0]); e.target.value=""; }} />
+
+            <div style={{ display:"flex", alignItems:"center", gap:12, margin:"18px 0", color:C.textMuted, fontSize:12 }}>
+              <div style={{ flex:1, height:1, background:C.border }} /> or paste text directly <div style={{ flex:1, height:1, background:C.border }} />
+            </div>
+
+            <textarea value={pasteText} onChange={e=>setPaste(e.target.value)}
+              placeholder="Paste meeting minutes, Teams messages, email text, action tables…"
+              style={{ width:"100%", minHeight:200, fontFamily:"inherit", fontSize:13, border:`1px solid ${C.border}`, borderRadius:6, padding:"12px 14px", resize:"vertical", color:C.text, background:C.white, outline:"none" }} />
+
+            <div style={{ display:"flex", gap:10, marginTop:10 }}>
+              <button onClick={handlePaste} disabled={extracting||!pasteText.trim()}
+                style={{ ...S.primary, opacity:extracting||!pasteText.trim()?0.5:1, cursor:extracting||!pasteText.trim()?"not-allowed":"pointer" }}>
+                {extracting ? "Extracting…" : "Extract my actions"}
+              </button>
+              <button onClick={()=>setPaste("")} style={S.ghost}>Clear</button>
+            </div>
+
+            <div style={{ marginTop:20, background:C.white, border:`1px solid ${C.border}`, borderRadius:8, padding:"12px 16px", fontSize:12, color:C.textMuted, lineHeight:1.8 }}>
+              <div style={{ fontWeight:700, color:C.darkGreen, marginBottom:6 }}>What works</div>
+              <div>• <strong>PDF minutes</strong> — drag straight from File Explorer or Outlook</div>
+              <div>• <strong>Word documents</strong> — drag .docx files directly in</div>
+              <div>• <strong>Teams messages</strong> — copy the text, paste above</div>
+              <div>• <strong>Email action tables</strong> — copy from Outlook, paste above</div>
+            </div>
+          </div>
+        )}
+
+        {/* ── BOARD TAB ── */}
+        {view==="board" && (
+          <div>
+            <div style={{ display:"flex", gap:8, marginBottom:14, flexWrap:"wrap", alignItems:"center" }}>
+              <div style={{ display:"flex", background:C.white, border:`1px solid ${C.border}`, borderRadius:6, overflow:"hidden" }}>
+                {[["active","Open"],["completed","Done"],["all","All"]].map(([v,l]) => (
+                  <button key={v} onClick={()=>setFilter(v)} style={{ padding:"5px 13px", fontSize:12, border:"none", cursor:"pointer", fontFamily:"inherit",
+                    background:filter===v?C.darkGreen:C.white, color:filter===v?C.white:C.textMuted, fontWeight:filter===v?600:400 }}>{l}</button>
+                ))}
+              </div>
+              <div style={{ display:"flex", background:C.white, border:`1px solid ${C.border}`, borderRadius:6, overflow:"hidden" }}>
+                {[["project","Project"],["priority","Priority"],["none","Flat"]].map(([v,l]) => (
+                  <button key={v} onClick={()=>setGroupBy(v)} style={{ padding:"5px 13px", fontSize:12, border:"none", cursor:"pointer", fontFamily:"inherit",
+                    background:groupBy===v?C.midGreen:C.white, color:groupBy===v?C.darkGreen:C.textMuted, fontWeight:groupBy===v?600:400 }}>{l}</button>
+                ))}
+              </div>
+              <button onClick={()=>setShowAdd(v=>!v)} style={{ ...S.primary, marginLeft:"auto", fontSize:12 }}>+ Add task</button>
+            </div>
+
+            {showAdd && (
+              <div style={{ background:C.white, border:`1px solid ${C.midGreen}`, borderRadius:8, padding:16, marginBottom:16 }}>
+                <div style={{ fontSize:13, fontWeight:600, color:C.darkGreen, marginBottom:10 }}>Add task manually</div>
+                <textarea placeholder="Task description *" value={manual.task} onChange={e=>setManual(d=>({...d,task:e.target.value}))}
+                  style={{ ...S.input, minHeight:50, resize:"vertical", marginBottom:8 }} />
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:8 }}>
+                  <input placeholder="Project" value={manual.project} onChange={e=>setManual(d=>({...d,project:e.target.value}))} style={S.input} />
+                  <input type="date" value={manual.dueDate} onChange={e=>setManual(d=>({...d,dueDate:e.target.value}))} style={S.input} />
+                  <select value={manual.priority} onChange={e=>setManual(d=>({...d,priority:e.target.value}))} style={S.input}>
+                    <option>High</option><option>Medium</option><option>Low</option>
+                  </select>
+                  <input placeholder="Source / meeting" value={manual.source} onChange={e=>setManual(d=>({...d,source:e.target.value}))} style={S.input} />
+                </div>
+                <div style={{ display:"flex", gap:8 }}>
+                  <button onClick={addManual} style={S.primary}>Add</button>
+                  <button onClick={()=>setShowAdd(false)} style={S.ghost}>Cancel</button>
+                </div>
+              </div>
+            )}
+
+            {filtered.length===0 ? (
+              <div style={{ textAlign:"center", padding:"56px 0", color:C.textMuted, fontSize:14 }}>
+                <div style={{ fontSize:36, marginBottom:10 }}>{filter==="completed"?"📋":"✅"}</div>
+                {filter==="active" ? "No open actions — import minutes or check emails to get started." : `No ${filter} tasks.`}
+              </div>
+            ) : (
+              Object.entries(grouped).map(([group,items]) => (
+                <div key={group} style={{ marginBottom:22 }}>
+                  {groupBy!=="none" && (
+                    <div style={{ fontSize:11, fontWeight:700, letterSpacing:"0.07em", color:C.darkGreen, textTransform:"uppercase",
+                      marginBottom:9, paddingBottom:5, borderBottom:`1px solid ${C.border}`, display:"flex", justifyContent:"space-between" }}>
+                      <span>{group}</span>
+                      <span style={{ fontWeight:400, color:C.textMuted, textTransform:"none", fontSize:12 }}>{items.filter(t=>!t.completed).length} open</span>
+                    </div>
+                  )}
+                  {items.map(task => (
+                    <TaskCard key={task.id} task={task}
+                      onToggle={toggleTask} onUpdate={updateTask} onDelete={deleteTask}
+                      onDragStart={id=>setDragId(id)} onDragOver={handleDragOver} onDrop={()=>setDragId(null)} />
+                  ))}
+                </div>
+              ))
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.render(<App />, document.getElementById("root"));
+</script>
+</body>
+</html>
